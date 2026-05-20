@@ -1,0 +1,31 @@
+# infrastructure/dbt-ci-cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dbt-transformation-pipeline
+  namespace: local-data-platform
+spec:
+  schedule: "0 * * * *"  # Runs at the top of every hour
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: dbt-runner
+            image: ghcr.io/dbt-labs/dbt-bigquery:1.7.0
+            command: ["/bin/sh", "-c"]
+            args:
+            - |
+              cd /usr/app/dbt_project
+              dbt deps
+              dbt run --profiles-dir . --target dev
+              dbt test --profiles-dir . --target dev
+            volumeMounts:
+            - name: dbt-project-files
+              mountPath: /usr/app/dbt_project
+          # You would map your repository code or storage layer mounts here
+          volumes:
+          - name: dbt-project-files
+            configMap:
+              name: dbt-project-config # Map your project structure files directly

@@ -1,0 +1,260 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bhdb-data-platform
+---
+# --- 1. CORE DATA PLATFORM APPLICATIONS CODE ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-platform-scripts
+  namespace: bhdb-data-platform
+data:
+  producer.py: |
+    import json, time, random
+    from kafka import KafkaProducer
+
+    # DNS endpoint connects to our standalone kafka service defined lower in this file
+    producer = KafkaProducer(
+        bootstrap_servers=['kafka-service.bhdb-data-platform.svc.cluster.local:9092'],
+        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+    )
+
+    print("🚀 Ingestion starting...")
+    while True:
+        event = {"event_id": random.randint(10000, 99999), "user_id": random.randint(1, 1000), "amount": round(random.uniform(5.0, 500.0), 2), "timestamp": int(time.time())}
+        producer.send('transactions', event)
+        print(f"Dispatched transaction event: {event}")
+        time.sleep(1)
+
+  spark_stream.py: |
+    from pyspark.sql import SparkSession
+    from pyspark.sql.functions import from_json, col
+    from pyspark.sql.types import StructType, StructField, IntegerType, DoubleType
+
+    spark = SparkSession.builder \
+        .appName("KubernetesKafkaToS3") \
+        .config("spark.hadoop.fs.s3a.endpoint", "http://minio-service.bhdb-data-platform.svc.cluster.local:9000") \
+        .config("spark.hadoop.fs.s3a.access.key", "admin") \
+        .config("spark.hadoop.fs.s3a.secret.key", "supersecret") \
+        .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .getOrCreate()
+
+    schema = StructType([
+        StructField("event_id", IntegerType(), True),
+        StructField("user_id", IntegerType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("timestamp", IntegerType(), True)
+    ])
+
+    df = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "kafka-service.bhdb-data-platform.svc.cluster.local:9092") \
+        .option("subscribe", "transactions") \
+        .load()
+
+    parsed_df = df.selectExpr("CAST(value AS STRING) as json_str") \
+        .select(from_json(col("json_str"), schema).alias("data")).select("data.*")
+
+    query = parsed_df.writeStream \
+        .format("parquet") \
+        .option("path", "s3a://analytics-bucket/raw_transactions/") \
+        .option("checkpointLocation", "s3a://analytics-bucket/checkpoints/") \
+        .start()
+
+    query.awaitTermination()
+---
+# --- 2. INFRASTRUCTURE LAYER: APACHE KAFKA (KRAFT MODE) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: local-kafka-broker
+  namespace: bhdb-data-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+      - name: kafka
+        image: confluentinc/cp-kafka:7.5.3
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 9092
+        env:
+        # Confluent KRaft Configuration Variables
+        - name: KAFKA_NODE_ID
+          value: "1"
+        - name: KAFKA_PROCESS_ROLES
+          value: "broker,controller"
+        - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+          value: "1@127.0.0.1:9093"
+        - name: KAFKA_LISTENERS
+          value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+        - name: KAFKA_ADVERTISED_LISTENERS
+          value: "PLAINTEXT://kafka-service.bhdb-data-platform.svc.cluster.local:9092"
+        - name: KAFKA_CONTROLLER_LISTENER_NAMES
+          value: "CONTROLLER"
+        - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+          value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+        - name: KAFKA_OFFER_SELF_CONNECTED_NODE_TO_PRODUCER
+          value: "true"
+        # Confluent images require an explicit Cluster ID automatically formatted for KRaft mode
+        - name: CLUSTER_ID
+          value: "MkU3OEVBNTcwNTJENDM2Qk"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-service
+  namespace: bhdb-data-platform
+spec:
+  selector:
+    app: kafka
+  ports:
+  - name: client
+    port: 9092
+    targetPort: 9092
+---
+# --- 3. INFRASTRUCTURE LAYER: MINIO (LOCAL S3 MOCK) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: local-minio-s3
+  namespace: bhdb-data-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:latest
+        imagePullPolicy: IfNotPresent
+        command: ["minio"]
+        args: ["server", "/data", "--console-address", ":9001"]
+        ports:
+        - containerPort: 9000  # API Port
+        - containerPort: 9001  # UI UI Dashboard Console
+        env:
+        - name: MINIO_ROOT_USER
+          value: "admin"
+        - name: MINIO_ROOT_PASSWORD
+          value: "supersecret"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-service
+  namespace: bhdb-data-platform
+spec:
+  selector:
+    app: minio
+  ports:
+  - name: api
+    port: 9000
+    targetPort: 9000
+  - name: console
+    port: 9001
+    targetPort: 9001
+---
+# --- 4. DATA ENGINE UTILITIES & INITIALIZERS ---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: s3-bucket-setup
+  namespace: bhdb-data-platform
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: minio-cli
+        image: minio/mc:latest
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mc alias set localk8s http://minio-service.bhdb-data-platform.svc.cluster.local:9000 admin supersecret;
+          mc mb --ignore-existing localk8s/analytics-bucket;
+---
+# --- 5. WORKLOAD WORKERS (PRODUCER & SPARK) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: python-ingestion-producer
+  namespace: bhdb-data-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: python-producer
+  template:
+    metadata:
+      labels:
+        app: python-producer
+    spec:
+      containers:
+      - name: producer-runtime
+        image: python:3.11-slim
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install kafka-python-ng
+          python /app/producer.py
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: script-mount
+          mountPath: /app
+      volumes:
+      - name: script-mount
+        configMap:
+          name: data-platform-scripts
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-streaming-engine
+  namespace: bhdb-data-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-stream
+  template:
+    metadata:
+      labels:
+        app: spark-stream
+    spec:
+      containers:
+      - name: spark-runtime
+        image: apache/spark:3.5.1
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          /opt/spark/bin/spark-submit \
+            --conf "spark.driver.extraJavaOptions=-Duser.home=/tmp" \
+            --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4 \
+            /app/spark_stream.py
+        volumeMounts:
+        - name: script-mount
+          mountPath: /app
+      volumes:
+      - name: script-mount
+        configMap:
+          name: data-platform-scripts
