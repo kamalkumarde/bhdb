@@ -174,3 +174,71 @@ spec:
       - name: runtime
         image: local-consumer:v1
         imagePullPolicy: Never
+
+# --- MinIO Object Storage Infrastructure ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: bhdb-data-platform
+spec:
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:RELEASE.2024-01-28T22-35-53Z
+        args: ["server", "/data", "--console-address", ":9001"]
+        ports:
+        - containerPort: 9000
+          name: api
+        - containerPort: 9001
+          name: console
+        env:
+        - name: MINIO_ROOT_USER
+          value: "admin"
+        - name: MINIO_ROOT_PASSWORD
+          value: "supersecret"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-service
+  namespace: bhdb-data-platform
+spec:
+  selector:
+    app: minio
+  ports:
+    - port: 9000
+      targetPort: 9000
+      name: api
+    - port: 9001
+      targetPort: 9001
+      name: console
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-bucket-init
+  namespace: bhdb-data-platform
+spec:
+  template:
+    spec:
+      containers:
+      - name: minio-cli
+        image: minio/mc:RELEASE.2024-01-28T22-40-50Z
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          until echo "Checking MinIO availability..." && curl -s http://minio-service:9000; do sleep 2; done;
+          /usr/bin/mc alias set local_minio http://minio-service:9000 admin supersecret;
+          /usr/bin/mc mb local_minio/analytics-bucket --ignore-existing;
+          echo "🎉 Bucket created successfully!";
+      restartPolicy: OnFailure
+
+

@@ -4,20 +4,27 @@ from pyspark.sql.functions import from_json, col
 from pyspark.sql.types import StructType, StructField, IntegerType, DoubleType
 import logging
 
-# Set up logging to standard output
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("ExtractionLogger")
+logger = logging.getLogger("IcebergExtractionLogger")
 
-print("🚀 Starting Spark Structured Streaming job to extract data from Kafka and write to S3...")
+print("🚀 Starting Spark Structured Streaming job with Iceberg support...")
+
+# Initialize Spark with Corrected MinIO S3 and Iceberg Configurations
 spark = SparkSession.builder \
-    .appName("KubernetesKafkaToS3") \
-    .config("spark.hadoop.fs.s3a.endpoint", "http://minio-service.bhdb-data-platform.svc.cluster.local:9000") \
+    .appName("KubernetesKafkaToIceberg") \
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+    .config("spark.sql.catalog.demo", "org.apache.iceberg.spark.SparkCatalog") \
+    .config("spark.sql.catalog.demo.type", "hadoop") \
+    .config("spark.sql.catalog.demo.warehouse", "s3a://analytics-bucket/warehouse") \
+    # FIX: Pointed directly back to your MinIO service instance container port
+    .config("spark.hadoop.fs.s3a.endpoint", "http://cluster.local") \
     .config("spark.hadoop.fs.s3a.access.key", "admin") \
     .config("spark.hadoop.fs.s3a.secret.key", "supersecret") \
     .config("spark.hadoop.fs.s3a.path.style.access", "true") \
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
     .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider") \
     .getOrCreate()
+
 print("✅ Spark session initialized with S3 configurations.")
 
 schema = StructType([
@@ -26,43 +33,38 @@ schema = StructType([
     StructField("amount", DoubleType(), True),
     StructField("timestamp", IntegerType(), True)
 ])
+print("✅ Defined schema for incoming Kafka JSON data.")
 
-print("🎯 Subscribing to Kafka topic 'transactions' for real-time data ingestion...")
 df = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "kafka-service.bhdb-data-platform.svc.cluster.local:9092") \
     .option("subscribe", "transactions") \
     .load()
-print("✅ Connected to Kafka and streaming data from 'transactions' topic.")
+print("✅ Connected to Kafka topic 'transactions' and started streaming data.")
 
 parsed_df = df.selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), schema).alias("data")).select("data.*")
+print("✅ Parsed incoming Kafka JSON data into structured format with defined schema.")
 
-print("📋 Target Stream Schema:")
-parsed_df.printSchema() # This executes standalone safely
+# Create the Iceberg table if it does not already exist in the catalog
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS demo.db.raw_transactions (
+        event_id INT,
+        user_id INT,
+        amount DOUBLE,
+        timestamp INT
+    ) USING iceberg
+""")
+print("✅ Iceberg table 'demo.db.raw_transactions' is verified/created.")
 
-# Custom function to log every transaction read and then write to S3
-def log_and_save_batch(batch_df, batch_id):
-    record_count = batch_df.count()
-    if record_count > 0:
-        logger.info(f"📥 Processing batch {batch_id} containing {record_count} transactions:")
-        rows = batch_df.collect()
-        for row in rows:
-            logger.info(f"👉 TX_READ: ID={row['event_id']} | User={row['user_id']} | Amt=${row['amount']} | TS={row['timestamp']}")
-            
-        # Write batch to S3
-        batch_df.write \
-            .format("parquet") \
-            .mode("append") \
-            .save("s3a://analytics-bucket/raw_transactions/")
-    else:
-        logger.debug(f"💤 Batch {batch_id} is empty.")
-
-print("🚀 Starting the unified Logging & S3 Storage stream...")
+# Stream writing using the modern Iceberg sink layout
 query = parsed_df.writeStream \
-    .foreachBatch(log_and_save_batch) \
-    .option("checkpointLocation", "s3a://analytics-bucket/checkpoints/") \
-    .start()
+    .format("iceberg") \
+    .outputMode("append") \
+    .option("checkpointLocation", "s3a://analytics-bucket/checkpoints/iceberg_raw/") \
+    .toTable("demo.db.raw_transactions")
 
+print("🚀 Streaming data is spinning into Iceberg table storage format continuously...")
+
+# Block main thread execution to let background threads ingest data safely
 query.awaitTermination()
-print("🛑 Streaming job has been terminated.")

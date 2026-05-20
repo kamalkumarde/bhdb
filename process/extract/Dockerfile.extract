@@ -13,6 +13,9 @@ ADD --chmod=644 https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle
 COPY process/extract/src/ ./src/
 USER spark
 
+# Ensure the iceberg package version matches your Spark runtime (e.g., 3.5_2.12:1.5.0)
+# Change the very last argument from the long path to this:
 CMD ["/opt/spark/bin/spark-submit", \
-     "--conf", "spark.driver.extraJavaOptions=-Duser.home=/tmp", \
-     "./src/extract_stream.py"]
+     "--conf", "spark.jars.ivy=/tmp", \
+     "--packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0", \
+     "src/extract_stream.py"] 
