@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+WORKDIR /app/consumer
+
+# Fast API application or visualization service to fetch calculated metrics
+COPY consumer/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY consumer/src/ ./src/
+CMD ["python", "-u", "src/consumer_api.py"]

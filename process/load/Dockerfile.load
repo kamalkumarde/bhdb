@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+WORKDIR /app/load
+
+# Lightweight loader script to take file arrays from S3 and write to Database
+COPY process/load/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY process/load/src/ ./src/
+CMD ["python", "-u", "src/load_job.py"]

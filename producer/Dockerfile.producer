@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+# Set the active workspace inside the container
+WORKDIR /app/producer
+
+# Copy dependencies first to maximize build caching performance
+COPY producer/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the entire local src contents into the container's active workspace folder
+COPY producer/src/ ./src/
+
+# Run the producer from its new path layout
+CMD ["python", "-u", "src/producer.py"]
